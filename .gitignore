@@ -1,0 +1,7 @@
+build/
+dist/
+web/node_modules/
+web/*.tsbuildinfo
+desktop/macos/.build/
+*.db
+.DS_Store
