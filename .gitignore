@@ -1,5 +1,6 @@
 build/
 dist/
+internal/app/webdist/
 web/node_modules/
 web/*.tsbuildinfo
 desktop/macos/.build/
