@@ -13,7 +13,7 @@ export default defineConfig({
         target: backend,
         changeOrigin: true,
         configure(proxy) {
-          proxy.on('proxyReq', proxyReq => {
+          proxy.on('proxyReq', (proxyReq) => {
             proxyReq.setHeader('Origin', backend);
           });
         },

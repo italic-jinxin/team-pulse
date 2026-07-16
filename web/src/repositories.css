@@ -1,29 +1,54 @@
 @reference "./styles.css";
 
-@layer components{
- .repohead{@apply flex w-full items-start justify-between gap-4 max-[760px]:flex-col max-[760px]:items-stretch}
- .repotools{@apply flex w-full items-center justify-between gap-3 max-[760px]:flex-col max-[760px]:items-stretch}
- .repotools .searchbox{@apply max-w-[420px] flex-1}
- .repotools>div{@apply flex flex-wrap gap-2}
- .repolist{@apply max-h-[420px] w-full overflow-auto rounded-2xl border border-[#e2e9e3] bg-[#fbfdfb]}
- .repolist label{@apply grid cursor-pointer grid-cols-[24px_minmax(0,1fr)] items-start gap-3 border-b border-[#edf2ee] p-3 transition hover:bg-[#f4f8f4] last:border-0}
- .repolist input[type="checkbox"]{@apply mt-1 h-4 w-4 shrink-0 accent-[#1e6f48]}
- .repolist label>span{@apply min-w-0}
- .repolist b,.repolist small{@apply block}
- .repolist b{@apply text-[13px] text-[#25372d]}
- .repolist small{@apply mt-1 text-xs leading-normal text-[#809087]}
- .settingsgrid{@apply grid-cols-[minmax(280px,.72fr)_minmax(420px,1.28fr)] items-start max-[1050px]:grid-cols-1}
+@layer components {
+  .repohead {
+    @apply flex w-full items-start justify-between gap-4 max-[760px]:flex-col max-[760px]:items-stretch;
+  }
+  .repotools {
+    @apply flex w-full items-center justify-between gap-3 max-[760px]:flex-col max-[760px]:items-stretch;
+  }
+  .repotools .searchbox {
+    @apply max-w-[420px] flex-1;
+  }
+  .repotools > div {
+    @apply flex flex-wrap gap-2;
+  }
+  .repolist {
+    @apply max-h-[420px] w-full overflow-auto rounded-2xl border border-[#e2e9e3] bg-[#fbfdfb];
+  }
+  .repolist label {
+    @apply grid cursor-pointer grid-cols-[24px_minmax(0,1fr)] items-start gap-3 border-b border-[#edf2ee] p-3 transition hover:bg-[#f4f8f4] last:border-0;
+  }
+  .repolist input[type='checkbox'] {
+    @apply mt-1 h-4 w-4 shrink-0 accent-[#1e6f48];
+  }
+  .repolist label > span {
+    @apply min-w-0;
+  }
+  .repolist b,
+  .repolist small {
+    @apply block;
+  }
+  .repolist b {
+    @apply text-[13px] text-[#25372d];
+  }
+  .repolist small {
+    @apply mt-1 text-xs leading-normal text-[#809087];
+  }
+  .settingsgrid {
+    @apply grid-cols-[minmax(280px,.72fr)_minmax(420px,1.28fr)] items-start max-[1050px]:grid-cols-1;
+  }
 }
 
-.form .repolist input[type="checkbox"]{
- width:1rem;
- min-width:1rem;
- max-width:1rem;
- height:1rem;
- padding:0;
- margin-top:.2rem;
+.form .repolist input[type='checkbox'] {
+  width: 1rem;
+  min-width: 1rem;
+  max-width: 1rem;
+  height: 1rem;
+  padding: 0;
+  margin-top: 0.2rem;
 }
 
-.form .repolist label{
- justify-content:start;
+.form .repolist label {
+  justify-content: start;
 }
