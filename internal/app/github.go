@@ -2,268 +2,389 @@ package app
 
 import (
 	"context"
-	"encoding/json"
+	"errors"
 	"fmt"
-	"io"
 	"net/http"
-	"os/exec"
+	"path"
 	"strings"
 	"time"
+
+	"github.com/italic-jinxin/team-pulse/internal/credentials"
+	appdb "github.com/italic-jinxin/team-pulse/internal/database"
+	githubclient "github.com/italic-jinxin/team-pulse/internal/github"
 )
 
-type ghClient struct {
-	token string
-	http  *http.Client
+type syncResourceError struct {
+	Resource string
+	Err      error
 }
 
-func (a *App) githubRepositories(w http.ResponseWriter, r *http.Request) {
-	c, err := githubClient()
+func (e *syncResourceError) Error() string { return e.Err.Error() }
+func (e *syncResourceError) Unwrap() error { return e.Err }
+
+func resourceError(resource string, err error) error {
+	return &syncResourceError{Resource: resource, Err: err}
+}
+
+func (a *App) githubClient(ctx context.Context) (*githubclient.Client, error) {
+	credential, err := a.Credentials.Get(ctx)
+	if errors.Is(err, credentials.ErrNotFound) {
+		return nil, fmt.Errorf("connect GitHub with a fine-grained PAT")
+	}
 	if err != nil {
-		respond(w, http.StatusUnauthorized, map[string]string{"error": err.Error()})
-		return
+		return nil, err
 	}
-	var repos []struct {
-		ID          int64  `json:"id"`
-		FullName    string `json:"full_name"`
-		Description string `json:"description"`
-		Private     bool   `json:"private"`
-		PushedAt    string `json:"pushed_at"`
-		Owner       struct {
-			AvatarURL string `json:"avatar_url"`
-		} `json:"owner"`
-	}
-	if err := c.get(r.Context(), "/user/repos?affiliation=owner,collaborator,organization_member&sort=pushed&direction=desc&per_page=100", &repos); err != nil {
-		respond(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
-		return
-	}
-	respond(w, http.StatusOK, repos)
+	return githubclient.NewClientWithBaseURL(credential.Token, 30*time.Second, a.GitHubBaseURL)
 }
 
-func githubClient() (*ghClient, error) {
-	auth.RLock()
-	token := auth.token
-	auth.RUnlock()
-	if token == "" {
-		out, err := exec.Command("gh", "auth", "token").Output()
-		if err != nil {
-			return nil, fmt.Errorf("connect GitHub with a PAT or run gh auth login")
-		}
-		token = strings.TrimSpace(string(out))
-	}
-	return &ghClient{token: token, http: &http.Client{Timeout: 30 * time.Second}}, nil
-}
-func (c *ghClient) get(ctx context.Context, path string, out any) error {
-	req, _ := http.NewRequestWithContext(ctx, "GET", "https://api.github.com"+path, nil)
-	req.Header.Set("Authorization", "Bearer "+c.token)
-	req.Header.Set("Accept", "application/vnd.github+json")
-	req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
-	res, err := c.http.Do(req)
+func (a *App) refreshRepositoryCatalog(ctx context.Context) error {
+	client, err := a.githubClient(ctx)
 	if err != nil {
 		return err
 	}
-	defer res.Body.Close()
-	if res.StatusCode/100 != 2 {
-		b, _ := io.ReadAll(io.LimitReader(res.Body, 2048))
-		return fmt.Errorf("GitHub API %d: %s", res.StatusCode, strings.TrimSpace(string(b)))
+	credential, err := a.Credentials.Get(ctx)
+	if err != nil {
+		return err
 	}
-	return json.NewDecoder(res.Body).Decode(out)
+	account, err := a.Repository.AccountByLogin(ctx, credential.Login)
+	if err != nil {
+		return err
+	}
+	repositories, err := client.ListRepositories(ctx)
+	if err != nil {
+		return err
+	}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	for _, repository := range repositories {
+		if _, err := a.Repository.UpsertRepository(ctx, account.ID, appdb.RepositoryFact{
+			GitHubID: repository.ID, NodeID: repository.NodeID,
+			OwnerLogin: repository.Owner.Login, Name: repository.Name, FullName: repository.FullName,
+			Description: repository.Description, Private: repository.Private,
+			DefaultBranch: repository.DefaultBranch, HTMLURL: repository.HTMLURL,
+			GitHubCreatedAt: repository.CreatedAt, GitHubUpdatedAt: repository.UpdatedAt,
+			PushedAt: repository.PushedAt, SyncedAt: now,
+		}); err != nil {
+			return err
+		}
+	}
+	return a.Repository.EnsureDefaultRepositorySelection(ctx, account.ID, 5)
 }
 
 func (a *App) startSync(w http.ResponseWriter, r *http.Request) {
-	var in struct {
-		Repositories []string `json:"repositories"`
+	var input struct {
+		RepositoryIDs []int64 `json:"repository_ids"`
 	}
-	if decode(r, &in) != nil || len(in.Repositories) == 0 {
-		respond(w, 400, map[string]string{"error": "repositories must contain owner/name values"})
+	if err := decode(r, &input); err != nil {
+		respondAPIError(w, r, http.StatusBadRequest, "INVALID_ARGUMENT", "Invalid sync request", nil)
 		return
 	}
-	for _, repo := range in.Repositories {
-		if len(strings.Split(repo, "/")) != 2 {
-			respond(w, 400, map[string]string{"error": "invalid repository: " + repo})
-			return
-		}
+	targets, err := a.Repository.SyncTargets(r.Context(), input.RepositoryIDs)
+	if err != nil {
+		respondAPIError(w, r, http.StatusBadRequest, "INVALID_ARGUMENT", err.Error(), nil)
+		return
 	}
 	id := nowID("sync")
-	now := time.Now().UTC().Format(time.RFC3339)
-	_, _ = a.DB.Exec("INSERT INTO jobs(id,type,status,progress,message,created_at) VALUES(?, 'github_sync','pending',0,'Queued',?)", id, now)
-	go a.sync(id, in.Repositories)
-	respond(w, 202, map[string]string{"job_id": id})
+	if err := a.Repository.CreateSyncJob(r.Context(), id, targets); err != nil {
+		respondAPIError(w, r, http.StatusInternalServerError, "DATABASE_ERROR", "Unable to create sync job", nil)
+		return
+	}
+	go a.sync(id, targets)
+	respond(w, http.StatusAccepted, map[string]string{"job_id": id, "status": "pending"})
 }
 
-func (a *App) sync(jobID string, repos []string) {
-	started := time.Now().UTC().Format(time.RFC3339)
-	_, _ = a.DB.Exec("UPDATE jobs SET status='running',started_at=?,message='Connecting to GitHub' WHERE id=?", started, jobID)
-	c, err := githubClient()
+func (a *App) sync(jobID string, targets []appdb.SyncTarget) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
+	defer cancel()
+	_ = a.Repository.UpdateJob(ctx, jobID, "running", "connect", "Connecting to GitHub", 0, 0, "", "")
+	client, err := a.githubClient(ctx)
 	if err != nil {
-		a.failJob(jobID, err)
+		a.failJob(ctx, jobID, err)
 		return
 	}
-	since := time.Now().AddDate(0, 0, -30).UTC().Format(time.RFC3339)
-	for i, repo := range repos {
-		base := i * 90 / len(repos)
-		next := (i + 1) * 90 / len(repos)
-		update := func(fraction int, message string) {
-			progress := base + (next-base)*fraction/100
-			_, _ = a.DB.Exec("UPDATE jobs SET progress=?,message=? WHERE id=?", progress, message, jobID)
-		}
-		update(3, "Starting "+repo)
-		if err := a.syncRepo(context.Background(), c, repo, since, update); err != nil {
-			a.failJob(jobID, fmt.Errorf("%s: %w", repo, err))
-			return
-		}
-	}
-	_, _ = a.DB.Exec("UPDATE jobs SET progress=92,message='Scanning risk signals' WHERE id=?", jobID)
-	if err := a.scanRisks(); err != nil {
-		a.failJob(jobID, err)
-		return
-	}
-	ended := time.Now().UTC().Format(time.RFC3339)
-	_, _ = a.DB.Exec("UPDATE jobs SET status='completed',progress=100,message='Sync complete',ended_at=? WHERE id=?", ended, jobID)
-}
-func (a *App) failJob(id string, err error) {
-	_, _ = a.DB.Exec("UPDATE jobs SET status='failed',error=?,message='Sync failed',ended_at=? WHERE id=?", err.Error(), time.Now().UTC().Format(time.RFC3339), id)
+	a.syncWithClient(ctx, jobID, targets, client)
 }
 
-func (a *App) syncRepo(ctx context.Context, c *ghClient, repo, since string, update func(fraction int, message string)) error {
-	var meta struct {
-		ID            int64  `json:"id"`
-		FullName      string `json:"full_name"`
-		Description   string `json:"description"`
-		Private       bool   `json:"private"`
-		DefaultBranch string `json:"default_branch"`
-		UpdatedAt     string `json:"updated_at"`
-	}
-	update(8, "Reading repository metadata for "+repo)
-	if err := c.get(ctx, "/repos/"+repo, &meta); err != nil {
-		return err
-	}
-	_, _ = a.DB.Exec(`INSERT INTO repositories(id,full_name,description,private,default_branch,updated_at) VALUES(?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET full_name=excluded.full_name,description=excluded.description,private=excluded.private,default_branch=excluded.default_branch,updated_at=excluded.updated_at`, meta.ID, meta.FullName, meta.Description, meta.Private, meta.DefaultBranch, meta.UpdatedAt)
-	var commits []struct {
-		SHA     string `json:"sha"`
-		HTMLURL string `json:"html_url"`
-		Commit  struct {
-			Message string `json:"message"`
-			Author  struct {
-				Date string `json:"date"`
-				Name string `json:"name"`
-			} `json:"author"`
-		} `json:"commit"`
-		Author *struct {
-			Login  string `json:"login"`
-			Avatar string `json:"avatar_url"`
-		} `json:"author"`
-	}
-	update(22, "Fetching commits for "+repo)
-	if err := c.get(ctx, "/repos/"+repo+"/commits?since="+since+"&per_page=100", &commits); err != nil {
-		return err
-	}
-	for _, v := range commits {
-		actor := v.Commit.Author.Name
-		avatar := ""
-		if v.Author != nil {
-			actor = v.Author.Login
-			avatar = v.Author.Avatar
-		}
-		title := strings.Split(v.Commit.Message, "\n")[0]
-		_, _ = a.DB.Exec("INSERT OR REPLACE INTO activities(id,repository,actor,type,title,url,occurred_at,metadata_json) VALUES(?,?,?,?,?,?,?,?)", "commit:"+v.SHA, repo, actor, "commit.pushed", title, v.HTMLURL, v.Commit.Author.Date, "{}")
-		a.upsertMember(actor, avatar, "commits", v.Commit.Author.Date)
-	}
-	var prs []struct {
-		ID        int64  `json:"id"`
-		Number    int    `json:"number"`
-		Title     string `json:"title"`
-		HTMLURL   string `json:"html_url"`
-		State     string `json:"state"`
-		CreatedAt string `json:"created_at"`
-		UpdatedAt string `json:"updated_at"`
-		MergedAt  string `json:"merged_at"`
-		Draft     bool   `json:"draft"`
-		User      struct {
-			Login  string `json:"login"`
-			Avatar string `json:"avatar_url"`
-		} `json:"user"`
-	}
-	update(45, "Fetching pull requests for "+repo)
-	if err := c.get(ctx, "/repos/"+repo+"/pulls?state=all&sort=updated&direction=desc&per_page=100", &prs); err != nil {
-		return err
-	}
-	for i, p := range prs {
-		if p.UpdatedAt < since {
+func (a *App) syncWithClient(ctx context.Context, jobID string, targets []appdb.SyncTarget, client *githubclient.Client) {
+	since := time.Now().AddDate(0, 0, -30).UTC().Format(time.RFC3339)
+	failures := 0
+	for index, target := range targets {
+		_ = a.Repository.UpdateJobRepository(ctx, jobID, target.ID, "running")
+		progress := index * 90 / len(targets)
+		_ = a.Repository.UpdateJob(ctx, jobID, "running", "repository", "Syncing "+target.FullName, progress, index, "", "")
+		if err := a.syncRepo(ctx, client, target, since); err != nil {
+			failures++
+			resource := "repository"
+			var typed *syncResourceError
+			if errors.As(err, &typed) {
+				resource = typed.Resource
+			}
+			_ = a.Repository.UpdateJobRepository(ctx, jobID, target.ID, "failed")
+			_ = a.Repository.AddJobError(ctx, jobID, &target.ID, resource, "GITHUB_SYNC_FAILED", err.Error())
+			_ = a.Repository.MarkRepositorySync(ctx, target.ID, "failed", "GITHUB_SYNC_FAILED", err.Error())
 			continue
 		}
-		if len(prs) > 0 {
-			update(55+i*40/len(prs), fmt.Sprintf("Reading PR #%d in %s", p.Number, repo))
-		}
-		var detail struct {
-			Additions int `json:"additions"`
-			Deletions int `json:"deletions"`
-		}
-		_ = c.get(ctx, fmt.Sprintf("/repos/%s/pulls/%d", repo, p.Number), &detail)
-		review, ci := a.prStates(ctx, c, repo, p.Number)
-		id := fmt.Sprint(p.ID)
-		_, _ = a.DB.Exec(`INSERT OR REPLACE INTO pull_requests(id,repository,number,title,author,url,state,draft,review_state,ci_state,additions,deletions,created_at,updated_at,merged_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, id, repo, p.Number, p.Title, p.User.Login, p.HTMLURL, p.State, p.Draft, review, ci, detail.Additions, detail.Deletions, p.CreatedAt, p.UpdatedAt, nullable(p.MergedAt))
-		typ := "pr.updated"
-		if p.MergedAt != "" {
-			typ = "pr.merged"
-		}
-		_, _ = a.DB.Exec("INSERT OR REPLACE INTO activities(id,repository,actor,type,title,url,occurred_at,metadata_json) VALUES(?,?,?,?,?,?,?,?)", "pr:"+id, repo, p.User.Login, typ, p.Title, p.HTMLURL, p.UpdatedAt, "{}")
-		a.upsertMember(p.User.Login, p.User.Avatar, "pull_requests", p.UpdatedAt)
+		_ = a.Repository.UpdateJobRepository(ctx, jobID, target.ID, "completed")
+		_ = a.Repository.MarkRepositorySync(ctx, target.ID, "completed", "", "")
 	}
-	update(100, "Finished "+repo)
-	return nil
-}
-func (a *App) prStates(ctx context.Context, c *ghClient, repo string, n int) (string, string) {
-	var reviews []struct {
-		ID          int64  `json:"id"`
-		State       string `json:"state"`
-		SubmittedAt string `json:"submitted_at"`
-		User        struct {
-			Login     string `json:"login"`
-			AvatarURL string `json:"avatar_url"`
-		} `json:"user"`
-	}
-	_ = c.get(ctx, fmt.Sprintf("/repos/%s/pulls/%d/reviews?per_page=100", repo, n), &reviews)
-	state := "waiting"
-	for _, rv := range reviews {
-		switch rv.State {
-		case "APPROVED":
-			state = "approved"
-		case "CHANGES_REQUESTED":
-			state = "changes_requested"
-		}
-		a.upsertMember(rv.User.Login, rv.User.AvatarURL, "reviews", rv.SubmittedAt)
-		_, _ = a.DB.Exec("INSERT OR REPLACE INTO activities(id,repository,actor,type,title,url,occurred_at,metadata_json) VALUES(?,?,?,?,?,?,?,?)", fmt.Sprintf("review:%d", rv.ID), repo, rv.User.Login, "pr.reviewed", fmt.Sprintf("Reviewed #%d", n), "", rv.SubmittedAt, marshal(map[string]string{"state": rv.State}))
-	}
-	var runs struct {
-		WorkflowRuns []struct {
-			Conclusion string `json:"conclusion"`
-		} `json:"workflow_runs"`
-	}
-	ci := "unknown"
-	if c.get(ctx, fmt.Sprintf("/repos/%s/actions/runs?event=pull_request&per_page=20", repo), &runs) == nil {
-		for _, run := range runs.WorkflowRuns {
-			if run.Conclusion == "failure" {
-				ci = "failed"
-				break
-			}
-			if run.Conclusion == "success" {
-				ci = "passed"
-			}
-		}
-	}
-	return state, ci
-}
-func (a *App) upsertMember(login, avatar, kind, date string) {
-	if login == "" {
+	_ = a.Repository.UpdateJob(ctx, jobID, "running", "risk_scan", "Scanning risk signals", 95, len(targets), "", "")
+	if err := a.scanRisks(ctx); err != nil {
+		a.failJob(ctx, jobID, err)
 		return
 	}
-	col := "commits"
-	if kind == "pull_requests" {
-		col = "pull_requests"
+	if failures > 0 {
+		_ = a.Repository.UpdateJob(ctx, jobID, "partial", "complete", "Sync completed with errors", 100, len(targets)-failures, "SYNC_PARTIAL", fmt.Sprintf("%d repositories failed", failures))
+		return
 	}
-	if kind == "reviews" {
-		col = "reviews"
+	_ = a.Repository.UpdateJob(ctx, jobID, "completed", "complete", "Sync complete", 100, len(targets), "", "")
+}
+
+func (a *App) failJob(ctx context.Context, id string, err error) {
+	_ = a.Repository.UpdateJob(ctx, id, "failed", "failed", "Sync failed", 100, 0, "GITHUB_SYNC_FAILED", err.Error())
+}
+
+func (a *App) syncRepo(ctx context.Context, client *githubclient.Client, target appdb.SyncTarget, since string) error {
+	credential, err := a.Credentials.Get(ctx)
+	if err != nil {
+		return resourceError("repository", err)
 	}
-	q := fmt.Sprintf(`INSERT INTO members(login,avatar_url,%s,last_active_at) VALUES(?,?,1,?) ON CONFLICT(login) DO UPDATE SET avatar_url=CASE WHEN excluded.avatar_url='' THEN members.avatar_url ELSE excluded.avatar_url END,%s=%s+1,last_active_at=MAX(last_active_at,excluded.last_active_at)`, col, col, col)
-	_, _ = a.DB.Exec(q, login, avatar, date)
+	account, err := a.Repository.AccountByLogin(ctx, credential.Login)
+	if err != nil {
+		return resourceError("repository", err)
+	}
+	metadata, err := client.GetRepository(ctx, target.FullName)
+	if err != nil {
+		return resourceError("repository", fmt.Errorf("repository metadata: %w", err))
+	}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	repositoryID, err := a.Repository.UpsertRepository(ctx, account.ID, appdb.RepositoryFact{
+		GitHubID: metadata.ID, NodeID: metadata.NodeID, OwnerLogin: metadata.Owner.Login,
+		Name: metadata.Name, FullName: metadata.FullName, Description: metadata.Description,
+		Private: metadata.Private, DefaultBranch: metadata.DefaultBranch, HTMLURL: metadata.HTMLURL,
+		GitHubCreatedAt: metadata.CreatedAt, GitHubUpdatedAt: metadata.UpdatedAt,
+		PushedAt: metadata.PushedAt, SyncedAt: now,
+	})
+	if err != nil {
+		return resourceError("repository", fmt.Errorf("save repository metadata: %w", err))
+	}
+
+	commits, err := client.ListCommits(ctx, target.FullName, since)
+	if err != nil {
+		return resourceError("commits", fmt.Errorf("commits: %w", err))
+	}
+	for _, commit := range commits {
+		authorLogin := commit.Commit.Author.Name
+		var authorID *int64
+		if commit.Author != nil {
+			authorLogin = commit.Author.Login
+			authorID, err = a.Repository.UpsertMember(ctx, memberFact(*commit.Author, now))
+			if err != nil {
+				return resourceError("commits", fmt.Errorf("save commit author: %w", err))
+			}
+		}
+		var committerID *int64
+		if commit.Committer != nil {
+			committerID, err = a.Repository.UpsertMember(ctx, memberFact(*commit.Committer, now))
+			if err != nil {
+				return resourceError("commits", fmt.Errorf("save commit committer: %w", err))
+			}
+		}
+		if err := a.Repository.UpsertCommit(ctx, appdb.CommitFact{
+			RepositoryID: repositoryID, SHA: commit.SHA, NodeID: commit.NodeID,
+			AuthorMemberID: authorID, AuthorLogin: authorLogin, AuthorName: commit.Commit.Author.Name,
+			CommitterMemberID: committerID, Message: commit.Commit.Message, HTMLURL: commit.HTMLURL,
+			AuthoredAt: commit.Commit.Author.Date, CommittedAt: commit.Commit.Committer.Date, SyncedAt: now,
+		}); err != nil {
+			return resourceError("commits", fmt.Errorf("save commit: %w", err))
+		}
+		title := strings.Split(commit.Commit.Message, "\n")[0]
+		if err := a.Repository.UpsertActivity(ctx, appdb.ActivityFact{
+			RepositoryID: repositoryID, ActorMemberID: authorID, ActorLogin: authorLogin,
+			EventType: "commit.pushed", SourceType: "commit", SourceID: commit.SHA,
+			Title: title, HTMLURL: commit.HTMLURL, OccurredAt: commit.Commit.Author.Date, SyncedAt: now,
+		}); err != nil {
+			return resourceError("commits", fmt.Errorf("save commit activity: %w", err))
+		}
+	}
+
+	pullRequests, err := client.ListPullRequests(ctx, target.FullName)
+	if err != nil {
+		return resourceError("pull_requests", fmt.Errorf("pull requests: %w", err))
+	}
+	for _, summary := range pullRequests {
+		if summary.UpdatedAt < since {
+			continue
+		}
+		detail, err := client.GetPullRequest(ctx, target.FullName, summary.Number)
+		if err != nil {
+			return resourceError("pull_requests", fmt.Errorf("pull request #%d: %w", summary.Number, err))
+		}
+		authorID, err := a.Repository.UpsertMember(ctx, memberFact(detail.User, now))
+		if err != nil {
+			return resourceError("pull_requests", fmt.Errorf("save pull request author: %w", err))
+		}
+		pullRequestID, err := a.Repository.UpsertPullRequest(ctx, appdb.PullRequestFact{
+			RepositoryID: repositoryID, GitHubID: detail.ID, NodeID: detail.NodeID,
+			Number: detail.Number, AuthorMemberID: authorID, AuthorLogin: detail.User.Login,
+			Title: detail.Title, Body: detail.Body, HTMLURL: detail.HTMLURL,
+			State: detail.State, Draft: detail.Draft, HeadRef: detail.Head.Ref, HeadSHA: detail.Head.SHA,
+			BaseRef: detail.Base.Ref, BaseSHA: detail.Base.SHA, Additions: detail.Additions,
+			Deletions: detail.Deletions, ChangedFiles: detail.ChangedFiles, FilesComplete: false,
+			LastAuthorActivityAt: detail.UpdatedAt, LastActivityAt: detail.UpdatedAt,
+			GitHubCreatedAt: detail.CreatedAt, GitHubUpdatedAt: detail.UpdatedAt,
+			ClosedAt: detail.ClosedAt, MergedAt: detail.MergedAt, SyncedAt: now,
+		})
+		if err != nil {
+			return resourceError("pull_requests", fmt.Errorf("save pull request: %w", err))
+		}
+		files, err := client.ListPullRequestFiles(ctx, target.FullName, detail.Number)
+		if err != nil {
+			return resourceError("pull_request_files", fmt.Errorf("pull request files for #%d: %w", detail.Number, err))
+		}
+		fileFacts := make([]appdb.PullRequestFileFact, 0, len(files))
+		for _, file := range files {
+			fact := classifyPullRequestFile(file.Filename)
+			fact.PreviousFilename = file.PreviousFilename
+			fact.Status = file.Status
+			fact.Additions = file.Additions
+			fact.Deletions = file.Deletions
+			fact.Changes = file.Changes
+			fileFacts = append(fileFacts, fact)
+		}
+		filesComplete := len(files) == detail.ChangedFiles
+		if err := a.Repository.ReplacePullRequestFiles(ctx, pullRequestID, fileFacts, filesComplete, now); err != nil {
+			return resourceError("pull_request_files", fmt.Errorf("save pull request files for #%d: %w", detail.Number, err))
+		}
+		if !filesComplete {
+			return resourceError("pull_request_files", fmt.Errorf(
+				"pull request files for #%d are incomplete: GitHub reported %d changed files but returned %d",
+				detail.Number, detail.ChangedFiles, len(files),
+			))
+		}
+		if err := a.syncReviews(ctx, client, target.FullName, repositoryID, pullRequestID, detail, now); err != nil {
+			return resourceError("reviews", err)
+		}
+		if err := a.syncWorkflowRuns(ctx, client, target.FullName, repositoryID, detail.Head.SHA, now); err != nil {
+			return resourceError("workflow_runs", err)
+		}
+		eventType := "pr.updated"
+		occurredAt := detail.UpdatedAt
+		if detail.MergedAt != "" {
+			eventType = "pr.merged"
+			occurredAt = detail.MergedAt
+		}
+		if err := a.Repository.UpsertActivity(ctx, appdb.ActivityFact{
+			RepositoryID: repositoryID, ActorMemberID: authorID, ActorLogin: detail.User.Login,
+			EventType: eventType, SourceType: "pull_request", SourceID: fmt.Sprint(detail.ID),
+			PullRequestID: &pullRequestID, Title: detail.Title, HTMLURL: detail.HTMLURL,
+			OccurredAt: occurredAt, SyncedAt: now,
+		}); err != nil {
+			return resourceError("pull_requests", fmt.Errorf("save pull request activity: %w", err))
+		}
+	}
+	return nil
+}
+
+func (a *App) syncReviews(ctx context.Context, client *githubclient.Client, repository string, repositoryID, pullRequestID int64, pullRequest githubclient.PullRequest, syncedAt string) error {
+	reviews, err := client.ListReviews(ctx, repository, pullRequest.Number)
+	if err != nil {
+		return fmt.Errorf("reviews for #%d: %w", pullRequest.Number, err)
+	}
+	for _, review := range reviews {
+		reviewerID, err := a.Repository.UpsertMember(ctx, memberFact(review.User, syncedAt))
+		if err != nil {
+			return fmt.Errorf("save reviewer: %w", err)
+		}
+		if err := a.Repository.UpsertReview(ctx, appdb.ReviewFact{
+			PullRequestID: pullRequestID, GitHubID: review.ID, NodeID: review.NodeID,
+			ReviewerID: reviewerID, ReviewerLogin: review.User.Login, State: review.State,
+			CommitSHA: review.CommitID, HTMLURL: review.HTMLURL,
+			SubmittedAt: review.SubmittedAt, SyncedAt: syncedAt,
+		}); err != nil {
+			return fmt.Errorf("save review: %w", err)
+		}
+		if review.SubmittedAt != "" {
+			if err := a.Repository.UpsertActivity(ctx, appdb.ActivityFact{
+				RepositoryID: repositoryID, ActorMemberID: reviewerID, ActorLogin: review.User.Login,
+				EventType: "pr.reviewed", SourceType: "review", SourceID: fmt.Sprint(review.ID),
+				PullRequestID: &pullRequestID, Title: fmt.Sprintf("Reviewed #%d", pullRequest.Number),
+				HTMLURL: review.HTMLURL, OccurredAt: review.SubmittedAt,
+				MetadataJSON: marshal(map[string]string{"state": review.State}), SyncedAt: syncedAt,
+			}); err != nil {
+				return fmt.Errorf("save review activity: %w", err)
+			}
+		}
+	}
+	return nil
+}
+
+func (a *App) syncWorkflowRuns(ctx context.Context, client *githubclient.Client, repository string, repositoryID int64, headSHA, syncedAt string) error {
+	runs, err := client.ListWorkflowRuns(ctx, repository, headSHA)
+	if err != nil {
+		return fmt.Errorf("workflow runs for head %s: %w", headSHA, err)
+	}
+	for _, run := range runs {
+		if run.HeadSHA != headSHA {
+			continue
+		}
+		if err := a.Repository.UpsertWorkflowRun(ctx, appdb.WorkflowRunFact{
+			RepositoryID: repositoryID, GitHubID: run.ID, NodeID: run.NodeID,
+			WorkflowID: run.WorkflowID, WorkflowName: run.Name, RunNumber: run.RunNumber,
+			RunAttempt: run.RunAttempt, Event: run.Event, HeadBranch: run.HeadBranch,
+			HeadSHA: run.HeadSHA, Status: run.Status, Conclusion: run.Conclusion,
+			HTMLURL: run.HTMLURL, GitHubCreatedAt: run.CreatedAt, GitHubUpdatedAt: run.UpdatedAt,
+			RunStartedAt: run.RunStartedAt, CompletedAt: completedAt(run), SyncedAt: syncedAt,
+		}); err != nil {
+			return fmt.Errorf("save workflow run: %w", err)
+		}
+	}
+	return nil
+}
+
+func classifyPullRequestFile(filename string) appdb.PullRequestFileFact {
+	normalized := strings.ToLower(strings.TrimSpace(filename))
+	base := path.Base(normalized)
+	extension := path.Ext(base)
+	segments := strings.Split(normalized, "/")
+	moduleName := ""
+	if len(segments) > 1 {
+		moduleName = segments[0]
+	}
+	languages := map[string]string{
+		".c": "C", ".cc": "C++", ".cpp": "C++", ".css": "CSS", ".go": "Go",
+		".html": "HTML", ".java": "Java", ".js": "JavaScript", ".jsx": "JavaScript",
+		".kt": "Kotlin", ".py": "Python", ".rb": "Ruby", ".rs": "Rust", ".swift": "Swift",
+		".sql": "SQL", ".ts": "TypeScript", ".tsx": "TypeScript",
+	}
+	dependencyFiles := map[string]bool{
+		"cargo.lock": true, "cargo.toml": true, "go.mod": true, "go.sum": true,
+		"package-lock.json": true, "package.json": true, "pnpm-lock.yaml": true,
+		"poetry.lock": true, "requirements.txt": true, "yarn.lock": true,
+	}
+	configurationExtensions := map[string]bool{
+		".ini": true, ".json": true, ".toml": true, ".yaml": true, ".yml": true,
+	}
+	isTest := strings.Contains(normalized, "/test/") || strings.Contains(normalized, "/tests/") ||
+		strings.Contains(base, ".test.") || strings.Contains(base, ".spec.") || strings.HasSuffix(base, "_test.go")
+	isDocumentation := strings.HasPrefix(normalized, "docs/") || extension == ".md" || extension == ".mdx" || extension == ".rst"
+	isMigration := strings.Contains(normalized, "/migrations/") || strings.HasPrefix(normalized, "migrations/") || strings.Contains(base, "migration")
+	return appdb.PullRequestFileFact{
+		Filename: filename, Language: languages[extension], ModuleName: moduleName,
+		IsTest: isTest, IsDocumentation: isDocumentation,
+		IsConfiguration: configurationExtensions[extension] || strings.HasPrefix(base, "."),
+		IsDependency:    dependencyFiles[base], IsMigration: isMigration,
+	}
+}
+
+func memberFact(user githubclient.User, syncedAt string) appdb.MemberFact {
+	return appdb.MemberFact{
+		GitHubID: user.ID, Login: user.Login, AvatarURL: user.AvatarURL,
+		ProfileURL: user.HTMLURL, UserType: user.Type, SyncedAt: syncedAt,
+	}
+}
+
+func completedAt(run githubclient.WorkflowRun) string {
+	if run.Status == "completed" {
+		return run.UpdatedAt
+	}
+	return ""
 }

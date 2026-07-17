@@ -10,6 +10,7 @@ export type DashboardData={
  reports:Row[];
  jobs:Row[];
  auth:Row;
+ settings:Row;
 };
 
 export type SyncJob={
@@ -25,6 +26,7 @@ export type SyncJob={
 };
 
 type ApiInit=RequestInit&{json?:unknown};
+type ListResponse<T>={items:T[];next_cursor:string|null};
 
 export async function api<T=unknown>(path:string,init:ApiInit={}):Promise<T>{
  const{json,...request}=init;
@@ -36,27 +38,33 @@ export async function api<T=unknown>(path:string,init:ApiInit={}):Promise<T>{
 
  if(!response.ok){
   const payload=await response.json().catch(()=>({}));
-  throw new Error(payload.error||response.statusText);
+  const message=typeof payload.error==='object'&&payload.error?.message?payload.error.message:payload.error||response.statusText;
+  throw new Error(message);
  }
 
  if(response.status===204)return null as T;
  return response.json() as Promise<T>;
 }
 
+export async function apiList<T=Row>(path:string):Promise<T[]>{
+ return(await api<ListResponse<T>>(path)).items;
+}
+
 export async function fetchDashboard():Promise<DashboardData>{
- const[status,repositories,activity,prs,members,risks,reports,jobs,auth]=await Promise.all([
+ const[status,repositories,activity,prs,members,risks,reports,jobs,auth,settings]=await Promise.all([
   api<Row>('/app/status'),
-  api<Row[]>('/repositories'),
-  api<Row[]>('/activity'),
-  api<Row[]>('/pull-requests'),
-  api<Row[]>('/members'),
-  api<Row[]>('/risks'),
-  api<Row[]>('/reports'),
-  api<Row[]>('/jobs'),
+  apiList('/repositories'),
+  apiList('/activities'),
+  apiList('/pull-requests'),
+  apiList('/members'),
+  apiList('/risks'),
+  apiList('/reports'),
+  apiList('/sync-jobs'),
   api<Row>('/github/auth/status'),
+  api<Row>('/settings'),
  ]);
 
- return{status,repositories,activity,prs,members,risks,reports,jobs,auth};
+ return{status,repositories,activity,prs,members,risks,reports,jobs,auth,settings};
 }
 
 export const queryKeys={

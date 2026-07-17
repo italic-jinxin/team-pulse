@@ -2,7 +2,7 @@ import{useEffect,useRef,useState}from'react';
 import{useMutation,useQuery,useQueryClient}from'@tanstack/react-query';
 import{GitPullRequest,RefreshCw,Search}from'lucide-react';
 import type{Row,SyncJob}from'../lib/api';
-import{api,cleanError,queryKeys}from'../lib/api';
+import{api,apiList,cleanError,queryKeys}from'../lib/api';
 import{Empty}from'../components/ui';
 import{Dropdown}from'../components/Dropdown';
 import{SyncDetails}from'../components/SyncDetails';
@@ -16,7 +16,7 @@ export function Settings({auth,jobs,externalJobId='',externalSelection=[],onJobS
  const[token,setToken]=useState('');
  const[notifications,setNotifications]=usePreference<NotificationPrefs>('teampulse.notifications',defaultNotifications);
  const[permission,setPermission]=useState(typeof Notification==='undefined'?'unsupported':Notification.permission);
- const[selected,setSelected]=useState<string[]>([]);
+ const[selected,setSelected]=useState<number[]>([]);
  const[message,setMessage]=useState('');
  const[repoQuery,setRepoQuery]=useState('');
  const[activeJobId,setActiveJobId]=useState('');
@@ -25,13 +25,13 @@ export function Settings({auth,jobs,externalJobId='',externalSelection=[],onJobS
 
  const repositories=useQuery({
   queryKey:queryKeys.repositories,
-  queryFn:()=>api<Row[]>('/github/repositories'),
+  queryFn:()=>apiList<Row>('/repositories'),
   enabled:!!auth?.authenticated,
  });
 
  const activeJob=useQuery({
   queryKey:queryKeys.job(activeJobId),
-  queryFn:async()=>((await api<SyncJob[]>(`/jobs/${activeJobId}`))[0]),
+  queryFn:()=>api<SyncJob>(`/sync-jobs/${activeJobId}`),
   enabled:!!activeJobId,
   refetchInterval:query=>{
    const status=(query.state.data as SyncJob|undefined)?.status;
@@ -41,7 +41,7 @@ export function Settings({auth,jobs,externalJobId='',externalSelection=[],onJobS
 
  useEffect(()=>{
   if(initializedSelection.current||!repositories.data?.length)return;
-  setSelected(repositories.data.slice(0,5).map(repo=>repo.full_name));
+  setSelected(persistedRepositorySelection(repositories.data));
   initializedSelection.current=true;
  },[repositories.data]);
 
@@ -52,16 +52,19 @@ export function Settings({auth,jobs,externalJobId='',externalSelection=[],onJobS
  });
 
  const syncRepositories=useMutation({
-  mutationFn:()=>api<{job_id:string}>('/repositories/sync',{method:'POST',json:{repositories:selected}}),
-  onSuccess:result=>{setActiveJobId(result.job_id);setSyncSelection(selected);onJobStart?.(result.job_id,selected);setMessage(`Sync started for ${selected.length} repositories`);queryClient.invalidateQueries({queryKey:queryKeys.dashboard});},
+  mutationFn:async()=>{
+   await api('/repositories/selection',{method:'PATCH',json:{repository_ids:selected}});
+   return api<{job_id:string}>('/sync-jobs',{method:'POST',json:{repository_ids:selected}});
+  },
+  onSuccess:result=>{const names=repositories.data?.filter(repo=>selected.includes(Number(repo.id))).map(repo=>String(repo.full_name))||[];setActiveJobId(result.job_id);setSyncSelection(names);onJobStart?.(result.job_id,names);setMessage(`Sync started for ${selected.length} repositories`);queryClient.invalidateQueries({queryKey:queryKeys.dashboard});},
   onError:error=>setMessage(explainError(error)),
  });
 
  useEffect(()=>{
   const status=activeJob.data?.status;
-  if(isTerminalJob(status)){
+ if(isTerminalJob(status)){
    queryClient.invalidateQueries({queryKey:queryKeys.dashboard});
-   setMessage(status==='completed'?'Sync completed. Dashboard data has been refreshed.':`Sync failed. ${activeJob.data?.error||activeJob.data?.message||'Check repository access and retry.'}`);
+   setMessage(status==='completed'?'Sync completed. Dashboard data has been refreshed.':status==='partial'?`Sync completed with errors. ${activeJob.data?.error||activeJob.data?.message||''}`:`Sync failed. ${activeJob.data?.error||activeJob.data?.message||'Check repository access and retry.'}`);
   }
  },[activeJob.data?.status,queryClient]);
 
@@ -88,17 +91,18 @@ export function Settings({auth,jobs,externalJobId='',externalSelection=[],onJobS
  },[activeJobId,externalJobId,jobs]);
 
  const repos=repositories.data||[];
+ const selectedNames=repos.filter(repo=>selected.includes(Number(repo.id))).map(repo=>String(repo.full_name));
  const filtered=repos.filter(repo=>JSON.stringify(repo).toLowerCase().includes(repoQuery.toLowerCase()));
  const busy=repositories.isFetching||connectToken.isPending||syncRepositories.isPending;
- const toggle=(name:string)=>setSelected(current=>current.includes(name)?current.filter(item=>item!==name):[...current,name]);
- const selectVisible=()=>setSelected(current=>Array.from(new Set([...current,...filtered.map(repo=>repo.full_name)])));
+ const toggle=(id:number)=>setSelected(current=>current.includes(id)?current.filter(item=>item!==id):current.length>=20?current:[...current,id]);
+ const selectVisible=()=>setSelected(current=>Array.from(new Set([...current,...filtered.map(repo=>Number(repo.id))])).slice(0,20));
 
  return <div className="settings-grid">
   <section className="card">
    <div className="card-header"><h2>GitHub Connection</h2><span>{auth?.authenticated?'Connected':'Not connected'}</span></div>
    <div className="card-body form">
    <div className="settingsicon"><GitPullRequest size={22}/></div>
-   <p>{auth?.authenticated?`Connected via ${auth.source}. You can now choose repositories to sync.`:'No GitHub token found. Run `gh auth login` in Terminal, or paste a fine-grained PAT with repository read access. Tokens entered here stay in memory only.'}</p>
+   <p>{auth?.authenticated?`Connected as ${auth.login} via ${auth.source}. You can now choose repositories to sync.`:'Paste a fine-grained PAT with repository read access. Tokens entered here stay in memory only.'}</p>
    <input type="password" placeholder="github_pat_…" value={token} onChange={event=>setToken(event.target.value)} aria-label="GitHub personal access token"/>
    <button disabled={!token.trim()||connectToken.isPending} onClick={()=>connectToken.mutate()}>{auth?.authenticated?'Update token':'Connect GitHub'}</button>
    {message&&<div className={message.startsWith('Sync started')?'inlinestatus':'inlineerror'}>{message}</div>}
@@ -112,10 +116,10 @@ export function Settings({auth,jobs,externalJobId='',externalSelection=[],onJobS
     <label className="searchbox"><Search size={16}/><input value={repoQuery} onChange={event=>setRepoQuery(event.target.value)} placeholder="Search repositories"/></label>
     <div><button type="button" className="secondary compactbtn" disabled={!filtered.length} onClick={selectVisible}>Select visible</button><button type="button" className="secondary compactbtn" disabled={!selected.length} onClick={()=>setSelected([])}>Clear</button></div>
    </div>
-   <div className="repolist">{filtered.map(repo=><label key={repo.id||repo.full_name}><input type="checkbox" checked={selected.includes(repo.full_name)} onChange={()=>toggle(repo.full_name)}/><span><b>{repo.full_name}</b><small>{repo.description||'No description'}{repo.private?' · Private':''}</small></span></label>)}{!repositories.isFetching&&!filtered.length&&<Empty title={repos.length?'No matching repositories':'No repositories loaded'} text={repos.length?'Try a different repository search.':auth?.authenticated?'Reload repositories. If this stays empty, confirm your token has repository read access.':'Connect GitHub first with gh auth login or a fine-grained PAT.'} compact/>}</div>
+   <div className="repolist">{filtered.map(repo=><label key={repo.id||repo.full_name}><input type="checkbox" checked={selected.includes(Number(repo.id))} onChange={()=>toggle(Number(repo.id))}/><span><b>{repo.full_name}</b><small>{repo.description||'No description'}{repo.private?' · Private':''}</small></span></label>)}{!repositories.isFetching&&!filtered.length&&<Empty title={repos.length?'No matching repositories':'No repositories loaded'} text={repos.length?'Try a different repository search.':auth?.authenticated?'Reload repositories. If this stays empty, confirm your token has repository read access.':'Connect GitHub with a fine-grained PAT first.'} compact/>}</div>
    <button disabled={!selected.length||busy} onClick={()=>syncRepositories.mutate()}>Sync {selected.length||''} repositories</button>
    {repositories.error&&<div className="inlineerror">{explainError(repositories.error)}</div>}
-   {(activeJobId||syncRepositories.isPending)&&<SyncDetails job={activeJob.data} loading={activeJob.isFetching||syncRepositories.isPending} repositories={syncSelection.length?syncSelection:selected}/>}
+   {(activeJobId||syncRepositories.isPending)&&<SyncDetails job={activeJob.data} loading={activeJob.isFetching||syncRepositories.isPending} repositories={syncSelection.length?syncSelection:selectedNames}/>}
    <RecentJobs jobs={jobs}/>
    </div>
   </section>
@@ -123,6 +127,10 @@ export function Settings({auth,jobs,externalJobId='',externalSelection=[],onJobS
   <NotificationSettings prefs={notifications} setPrefs={setNotifications} permission={permission} setPermission={setPermission}/>
   <SettingsCard title="Data & Privacy" meta="Local-first" rows={[['Database','~/Library/Application Support/TeamPulse/teampulse.db','SQLite'],['Repository cloning','API-only mode','No local clones'],['Cloud AI analysis','Disabled','No report data uploaded']]}/>
  </div>;
+}
+
+export function persistedRepositorySelection(repositories:Row[]){
+ return repositories.filter(repo=>repo.selected).map(repo=>Number(repo.id));
 }
 
 function NotificationSettings({prefs,setPrefs,permission,setPermission}:{prefs:NotificationPrefs;setPrefs:(value:NotificationPrefs)=>void;permission:string;setPermission:(value:string)=>void}){
@@ -151,7 +159,7 @@ function RecentJobs({jobs}:{jobs:Row[]}){
 }
 
 function isActiveJob(status?:string){return status==='pending'||status==='running';}
-function isTerminalJob(status?:string){return status==='completed'||status==='failed';}
+function isTerminalJob(status?:string){return status==='completed'||status==='partial'||status==='failed';}
 function isRecentActiveJob(job:Row){
  if(!isActiveJob(String(job.status)))return false;
  const raw=String(job.started_at||job.created_at||'');
@@ -162,7 +170,7 @@ function isRecentActiveJob(job:Row){
 function explainError(error:unknown){
  const message=cleanError(error);
  if(/rate limit|API 403/i.test(message))return`${message}. GitHub rate limit may be exhausted; wait for the reset window or use a token with higher limits.`;
- if(/connect GitHub|auth|token|401|rejected/i.test(message))return`${message}. Connect with \`gh auth login\` or paste a fine-grained PAT with repository read access.`;
+ if(/connect GitHub|auth|token|401|rejected/i.test(message))return`${message}. Paste a fine-grained PAT with repository read access.`;
  if(/Sync failed/i.test(message))return`${message}. Check the failed repository name and GitHub token permissions, then retry sync.`;
  return message;
 }
