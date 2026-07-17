@@ -5,7 +5,7 @@ import{ago}from'../lib/format';
 export function SyncDetails({job,loading=false,repositories=[]}:{job?:SyncJob;loading?:boolean;repositories?:string[]}){
  const status=job?.status||'starting';
  const progress=job?displayProgress(job):0;
- const terminal=status==='completed'||status==='failed';
+ const terminal=isTerminalSyncStatus(status);
  const info=parseSyncInfo(job?.message||'',repositories,progress);
  const progressLabel=[info.stage,info.currentRepo,info.repoProgress!=='—'?info.repoProgress:''].filter(Boolean).join(' · ');
  return <section className="syncpanel" aria-live="polite">
@@ -36,6 +36,8 @@ export function SyncDetails({job,loading=false,repositories=[]}:{job?:SyncJob;lo
   {job?.error&&<div className="inlineerror">{syncFailureDetail(job.error)}</div>}
  </section>;
 }
+
+export function isTerminalSyncStatus(status:string){return status==='completed'||status==='partial'||status==='failed';}
 
 function Detail({label,value}:{label:string;value:string}){return <div className="sync-detail"><span>{label}</span><strong>{value}</strong></div>;}
 
@@ -86,19 +88,20 @@ function elapsed(value:string){
 
 function title(status:string){
  if(status==='completed')return'Sync complete';
+ if(status==='partial')return'Sync completed with errors';
  if(status==='failed')return'Sync failed';
  return'GitHub sync in progress';
 }
 
 function statusTone(status:string){
  if(status==='completed')return'complete';
- if(status==='failed')return'failed';
+ if(status==='partial'||status==='failed')return'failed';
  return'active';
 }
 
 function statusIcon(status:string,loading:boolean){
  if(status==='completed')return <CheckCircle2 size={18}/>;
- if(status==='failed')return <CircleAlert size={18}/>;
+ if(status==='partial'||status==='failed')return <CircleAlert size={18}/>;
  if(loading||status==='running')return <Loader2 size={18} className="spin"/>;
  return <Clock3 size={18}/>;
 }

@@ -1,13 +1,24 @@
-.PHONY: web server run test clean macos
+.PHONY: web backend server run test check-repository clean macos
+
+GO_BUILD_FLAGS :=
+GO_TEST_FLAGS :=
+ifeq ($(shell go env GOOS),darwin)
+GO_BUILD_FLAGS += -ldflags='-linkmode=external'
+GO_TEST_FLAGS += -ldflags='-linkmode=external'
+endif
+
 web:
 	cd web && npm install && npm run build
-server: web
-	go build -o build/teampulse-server ./cmd/teampulse
+backend:
+	mkdir -p build
+	go build $(GO_BUILD_FLAGS) -o build/teampulse-server ./cmd/teampulse
+server: web backend
 run: server
 	./build/teampulse-server
-test:
-	go test ./...
-	cd web && npm run build
+test: check-repository web
+	go test $(GO_TEST_FLAGS) ./...
+check-repository:
+	./scripts/check-no-local-data.sh
 macos: server
 	cd desktop/macos && swift build -c release
 clean:

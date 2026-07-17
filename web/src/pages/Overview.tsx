@@ -34,10 +34,10 @@ export function Overview({data,onNavigate}:{data:DashboardData;onNavigate:(page:
 
 function Onboarding({connected,hasRepos,hasActivity,onNavigate}:{connected:boolean;hasRepos:boolean;hasActivity:boolean;onNavigate:(page:PageName)=>void}){
  const steps=[
-  ['Connect GitHub',connected,'Use GitHub CLI or a fine-grained PAT.'],
+  ['Connect GitHub',connected,'Use a fine-grained PAT with read-only repository access.'],
   ['Choose repositories',hasRepos,'Pick the repos TeamPulse should track.'],
   ['Run first sync',hasActivity,'Load the last 30 days of engineering activity.'],
-  ['Review risks',hasActivity,'Check stale reviews, CI failures, and large PRs.'],
+  ['Review risks',hasActivity,'Check review waits, stale pull requests, and CI failures.'],
   ['Generate report',hasActivity,'Create a local Markdown summary.'],
  ] as const;
  return <section className="onboarding card">
@@ -65,7 +65,7 @@ export function Feed({rows}:{rows:Row[]}){
 }
 
 export function RiskList({rows}:{rows:Row[]}){
- return rows.length?<ul className="risk-list">{rows.map((risk,index)=><li className="risk-item" key={risk.id||index}><div className="risk-top"><span className="risk-title">{risk.reason}</span><Badge value={risk.severity||'risk'}/></div><div className="risk-desc">{risk.repository}{risk.pr_number?` #${risk.pr_number}`:''} · {risk.suggested_action||'Review the signal'}</div></li>)}</ul>:<Empty title="No blockers detected" text="No stale reviews, failing checks, or large PR signals are currently open." compact/>;
+ return rows.length?<ul className="risk-list">{rows.map((risk,index)=><li className="risk-item" key={risk.id||index}><div className="risk-top"><span className="risk-title">{risk.reason}</span><Badge value={risk.severity||'risk'}/></div><div className="risk-desc">{risk.repository}{risk.pr_number?` #${risk.pr_number}`:''} · {risk.suggested_action||'Review the signal'}</div></li>)}</ul>:<Empty title="No blockers detected" text="No review waits, stale pull requests, or current-head CI failures are open." compact/>;
 }
 
 function Focus({rows}:{rows:Row[]}){

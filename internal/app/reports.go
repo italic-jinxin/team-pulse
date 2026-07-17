@@ -1,107 +1,141 @@
 package app
 
 import (
-	"fmt"
-	"github.com/go-chi/chi/v5"
+	"crypto/sha256"
+	"encoding/hex"
+	"errors"
 	"net/http"
-	"strings"
 	"time"
+
+	"github.com/go-chi/chi/v5"
+	appdb "github.com/italic-jinxin/team-pulse/internal/database"
+	reportdomain "github.com/italic-jinxin/team-pulse/internal/reports"
 )
 
 func (a *App) generateReport(w http.ResponseWriter, r *http.Request) {
-	var in struct {
-		Type     string `json:"type"`
-		Scope    string `json:"scope"`
-		Length   string `json:"length"`
-		Template string `json:"template"`
+	var input struct {
+		Kind          string  `json:"kind"`
+		PeriodStart   string  `json:"period_start"`
+		PeriodEnd     string  `json:"period_end"`
+		Timezone      string  `json:"timezone"`
+		RepositoryIDs []int64 `json:"repository_ids"`
 	}
-	_ = decode(r, &in)
-	if in.Type == "" {
-		in.Type = "weekly"
-	}
-	if in.Length == "" {
-		in.Length = "standard"
-	}
-	if in.Template == "" {
-		in.Template = "executive"
-	}
-	days := -7
-	if in.Type == "daily" {
-		days = -1
-	}
-	since := time.Now().AddDate(0, 0, days).UTC().Format(time.RFC3339)
-	var commits, prs, reviews, merged, risks int
-	_ = a.DB.QueryRow("SELECT COUNT(*) FROM activities WHERE type='commit.pushed' AND occurred_at>=?", since).Scan(&commits)
-	_ = a.DB.QueryRow("SELECT COUNT(*) FROM activities WHERE type IN ('pr.updated','pr.opened') AND occurred_at>=?", since).Scan(&prs)
-	_ = a.DB.QueryRow("SELECT COUNT(*) FROM activities WHERE type='pr.reviewed' AND occurred_at>=?", since).Scan(&reviews)
-	_ = a.DB.QueryRow("SELECT COUNT(*) FROM activities WHERE type='pr.merged' AND occurred_at>=?", since).Scan(&merged)
-	_ = a.DB.QueryRow("SELECT COUNT(*) FROM risks WHERE status='open'").Scan(&risks)
-	var b strings.Builder
-	titleKind := reportTitle(in.Type)
-	fmt.Fprintf(&b, "# TeamPulse %s\n\n_Generated %s_\n\n", titleKind, time.Now().Format("2 Jan 2006"))
-	writeReportIntro(&b, in.Template, commits, prs, reviews, merged, risks)
-	fmt.Fprintf(&b, "## Priority Risks\n\n")
-	limit := 5
-	if in.Length == "brief" {
-		limit = 3
-	}
-	if in.Length == "detailed" {
-		limit = 20
-	}
-	rows, _ := a.DB.Query("SELECT severity,repository,pr_number,reason,suggested_action FROM risks WHERE status='open' ORDER BY CASE severity WHEN 'high' THEN 1 WHEN 'medium' THEN 2 ELSE 3 END, detected_at DESC LIMIT ?", limit)
-	listed := 0
-	if rows != nil {
-		for rows.Next() {
-			var severity, repo, reason, action string
-			var n int
-			_ = rows.Scan(&severity, &repo, &n, &reason, &action)
-			fmt.Fprintf(&b, "### [%s] %s #%d\n\n%s. **Next:** %s.\n\n", strings.ToUpper(severity), repo, n, reason, action)
-			listed++
-		}
-		_ = rows.Close()
-	}
-	if listed == 0 {
-		fmt.Fprintf(&b, "No open priority risks detected.\n\n")
-	} else if risks > listed {
-		fmt.Fprintf(&b, "_%d additional open risks omitted. Use Detailed length for a longer export._\n\n", risks-listed)
-	}
-	id := nowID("report")
-	title := titleKind + " — " + time.Now().Format("2 Jan 2006")
-	created := time.Now().UTC().Format(time.RFC3339)
-	_, err := a.DB.Exec("INSERT INTO reports(id,type,title,markdown,created_at) VALUES(?,?,?,?,?)", id, in.Type, title, b.String(), created)
-	if err != nil {
-		respond(w, 500, map[string]string{"error": err.Error()})
+	if err := decode(r, &input); err != nil {
+		respondAPIError(w, r, http.StatusBadRequest, "INVALID_ARGUMENT", "Invalid report request", nil)
 		return
 	}
-	respond(w, 201, map[string]any{"id": id, "type": in.Type, "title": title, "markdown": b.String(), "created_at": created})
+	if input.Kind == "" {
+		input.Kind = "weekly"
+	}
+	if input.Kind != "weekly" {
+		respondAPIError(w, r, http.StatusBadRequest, "INVALID_ARGUMENT", "Alpha reports only support kind=weekly", nil)
+		return
+	}
+	if input.Timezone == "" {
+		input.Timezone = "Asia/Shanghai"
+	}
+	location, err := time.LoadLocation(input.Timezone)
+	if err != nil {
+		respondAPIError(w, r, http.StatusBadRequest, "INVALID_ARGUMENT", "Invalid IANA timezone", nil)
+		return
+	}
+	periodStart, periodEnd, err := reportdomain.Period(input.PeriodStart, input.PeriodEnd, location, time.Now())
+	if err != nil {
+		respondAPIError(w, r, http.StatusBadRequest, "INVALID_ARGUMENT", err.Error(), nil)
+		return
+	}
+	targets, err := a.Repository.SyncTargets(r.Context(), input.RepositoryIDs)
+	if err != nil {
+		respondAPIError(w, r, http.StatusBadRequest, "INVALID_ARGUMENT", err.Error(), nil)
+		return
+	}
+	repositoryIDs := make([]int64, 0, len(targets))
+	for _, target := range targets {
+		repositoryIDs = append(repositoryIDs, target.ID)
+	}
+	facts, err := a.Repository.ReportFacts(
+		r.Context(), repositoryIDs,
+		periodStart.UTC().Format(time.RFC3339Nano),
+		periodEnd.UTC().Format(time.RFC3339Nano),
+	)
+	if err != nil {
+		respondAPIError(w, r, http.StatusInternalServerError, "DATABASE_ERROR", "Unable to query report facts", nil)
+		return
+	}
+	credential, err := a.Credentials.Get(r.Context())
+	if err != nil {
+		respondAPIError(w, r, http.StatusUnauthorized, "CREDENTIAL_MISSING", "Connect GitHub before generating a report", nil)
+		return
+	}
+	account, err := a.Repository.AccountByLogin(r.Context(), credential.Login)
+	if err != nil {
+		respondAPIError(w, r, http.StatusInternalServerError, "DATABASE_ERROR", "Unable to identify report data source", nil)
+		return
+	}
+	markdown := reportdomain.RenderWeekly(periodStart, periodEnd, input.Timezone, facts)
+	sum := sha256.Sum256([]byte(markdown))
+	now := time.Now().UTC()
+	id := nowID("report")
+	scope := "selected"
+	if len(input.RepositoryIDs) > 0 {
+		scope = "explicit"
+	}
+	report := appdb.NewReport{
+		ID: id, SourceAccountID: account.ID, SourceAccountLogin: account.Login,
+		Kind: "weekly", Title: "Engineering Weekly Summary",
+		PeriodStart: periodStart.UTC().Format(time.RFC3339Nano),
+		PeriodEnd:   periodEnd.UTC().Format(time.RFC3339Nano),
+		Timezone:    input.Timezone, FactsCutoffAt: now.Format(time.RFC3339Nano),
+		RepositoryScope: scope, TemplateVersion: reportdomain.TemplateVersion,
+		Markdown: markdown, ContentSHA256: hex.EncodeToString(sum[:]),
+		RepositoryIDs: repositoryIDs, CreatedAt: now.Format(time.RFC3339Nano),
+	}
+	if err := a.Repository.SaveReport(r.Context(), report); err != nil {
+		respondAPIError(w, r, http.StatusInternalServerError, "DATABASE_ERROR", "Unable to save report", nil)
+		return
+	}
+	saved, err := a.Repository.GetReport(r.Context(), id)
+	if err != nil {
+		respondAPIError(w, r, http.StatusInternalServerError, "DATABASE_ERROR", "Unable to read generated report", nil)
+		return
+	}
+	respond(w, http.StatusCreated, saved)
 }
 
-func writeReportIntro(b *strings.Builder, template string, commits, prs, reviews, merged, risks int) {
-	switch template {
-	case "standup":
-		fmt.Fprintf(b, "## Standup\n\n- **Moved:** %d commits, %d merged pull requests\n- **In review:** %d active pull requests, %d reviews\n- **Blocked / watch:** %d open risks\n\n", commits, merged, prs, reviews, risks)
-	case "engineering":
-		fmt.Fprintf(b, "## Engineering Detail\n\n- Commits: %d\n- Active pull requests: %d\n- Reviews: %d\n- Merged pull requests: %d\n- Open risks: %d\n\n## Engineering Notes\n\n- Review PR queue for owner, review, CI, and size signals.\n- Use repository view to identify concentration of failed checks.\n\n", commits, prs, reviews, merged, risks)
-	case "risk":
-		fmt.Fprintf(b, "## Risk-Focused Summary\n\n- Open risks: %d\n- Active pull requests: %d\n- Reviews completed: %d\n\n", risks, prs, reviews)
-	default:
-		fmt.Fprintf(b, "## Executive Summary\n\n- %d commits\n- %d active pull requests\n- %d reviews\n- %d merged pull requests\n- %d open risks\n\n", commits, prs, reviews, merged, risks)
-	}
-}
-
-func reportTitle(kind string) string {
-	switch kind {
-	case "daily":
-		return "Daily Report"
-	case "risk":
-		return "Risk Summary"
-	default:
-		return "Weekly Report"
-	}
-}
 func (a *App) listReports(w http.ResponseWriter, r *http.Request) {
-	queryJSON(w, a.DB, "SELECT id,type,title,created_at FROM reports ORDER BY created_at DESC")
+	items, err := a.Repository.ListReports(r.Context())
+	if err != nil {
+		respondAPIError(w, r, http.StatusInternalServerError, "DATABASE_ERROR", "Unable to list reports", nil)
+		return
+	}
+	respondList(w, items)
 }
+
 func (a *App) getReport(w http.ResponseWriter, r *http.Request) {
-	queryJSON(w, a.DB, "SELECT id,type,title,markdown,created_at FROM reports WHERE id=?", chi.URLParam(r, "id"))
+	report, err := a.Repository.GetReport(r.Context(), chi.URLParam(r, "id"))
+	if errors.Is(err, appdb.ErrNotFound) {
+		respondAPIError(w, r, http.StatusNotFound, "NOT_FOUND", "Report not found", nil)
+		return
+	}
+	if err != nil {
+		respondAPIError(w, r, http.StatusInternalServerError, "DATABASE_ERROR", "Unable to read report", nil)
+		return
+	}
+	respond(w, http.StatusOK, report)
+}
+
+func (a *App) downloadReport(w http.ResponseWriter, r *http.Request) {
+	report, err := a.Repository.GetReport(r.Context(), chi.URLParam(r, "id"))
+	if errors.Is(err, appdb.ErrNotFound) {
+		respondAPIError(w, r, http.StatusNotFound, "NOT_FOUND", "Report not found", nil)
+		return
+	}
+	if err != nil || report.Markdown == nil {
+		respondAPIError(w, r, http.StatusInternalServerError, "DATABASE_ERROR", "Unable to download report", nil)
+		return
+	}
+	w.Header().Set("Content-Type", "text/markdown; charset=utf-8")
+	w.Header().Set("Content-Disposition", `attachment; filename="teampulse-weekly-report.md"`)
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte(*report.Markdown))
 }

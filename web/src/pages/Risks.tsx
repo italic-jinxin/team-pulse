@@ -1,25 +1,32 @@
-import{useMemo,useState}from'react';
+import{useEffect,useMemo,useState}from'react';
 import{useMutation,useQueryClient}from'@tanstack/react-query';
 import type{Row}from'../lib/api';
 import{api,queryKeys}from'../lib/api';
 import{Badge,Empty}from'../components/ui';
-import{defaultRiskRules,usePreference,type RiskRules}from'../lib/preferences';
 
-export function Risks({rows}:{rows:Row[]}){
+type RiskRules={waiting_review_hours:number;stale_pr_days:number;ci_failure_threshold:number};
+const defaults:RiskRules={waiting_review_hours:48,stale_pr_days:5,ci_failure_threshold:1};
+
+export function Risks({rows,settings}:{rows:Row[];settings:Row}){
  const[showLow,setShowLow]=useState(false);
- const[rules,setRules]=usePreference<RiskRules>('teampulse.riskRules',defaultRiskRules);
+ const[rules,setRules]=useState<RiskRules>(defaults);
  const queryClient=useQueryClient();
+ useEffect(()=>{if(settings?.risk_rules)setRules(settings.risk_rules as RiskRules);},[settings]);
  const resolveRisk=useMutation({
   mutationFn:(id:string)=>api(`/risks/${encodeURIComponent(id)}`,{method:'PATCH',json:{status:'resolved'}}),
+  onSuccess:()=>queryClient.invalidateQueries({queryKey:queryKeys.dashboard}),
+ });
+ const saveRules=useMutation({
+  mutationFn:()=>api('/settings',{method:'PATCH',json:{version:Number(settings.version||1),changes:{risk_rules:rules}}}),
   onSuccess:()=>queryClient.invalidateQueries({queryKey:queryKeys.dashboard}),
  });
 
  const visibleRows=showLow?rows:rows.filter(risk=>risk.severity!=='low');
  const groups=useMemo(()=>groupRisks(visibleRows),[visibleRows]);
  return <div className="split">
-  <section className="card tablewrap"><div className="card-header"><h2>Open Risk Signals</h2><span>{showLow?'All severities':'High / Medium only'}</span></div><div className="risk-toolbar"><div><strong>{groups.length} work items</strong><p>{rows.length} raw signals grouped by repository and PR.</p></div><button className="secondary compactbtn" onClick={()=>setShowLow(value=>!value)}>{showLow?'Hide low severity':'Show low severity'}</button></div>{groups.length?<table className="table"><thead><tr><th>Priority</th><th>Work item</th><th>Why this matters</th><th>Next step</th><th>Action</th></tr></thead><tbody>{groups.map(group=><tr key={group.key}><td><Badge value={group.severity}/></td><td><strong>{group.title}</strong><div className="meta">{group.repository}{group.pr_number?` #${group.pr_number}`:''} · {group.risks.length} signal{group.risks.length>1?'s':''}</div></td><td>{group.risks.slice(0,2).map(risk=><div key={risk.id}>{risk.reason}</div>)}</td><td>{group.nextStep}</td><td><button className="secondary compactbtn" disabled={resolveRisk.isPending} onClick={()=>group.risks.forEach(risk=>resolveRisk.mutate(String(risk.id)))}>Resolve group</button></td></tr>)}</tbody></table>:<Empty title="No priority risks" text={rows.length?'Low-severity risks are hidden. Use Show low severity to review them.':'No stale reviews, failing checks, or large PR signals are currently open.'}/>}</section>
+  <section className="card tablewrap"><div className="card-header"><h2>Open Risk Signals</h2><span>{showLow?'All severities':'High / Medium only'}</span></div><div className="risk-toolbar"><div><strong>{groups.length} work items</strong><p>{rows.length} raw signals grouped by repository and PR.</p></div><button className="secondary compactbtn" onClick={()=>setShowLow(value=>!value)}>{showLow?'Hide low severity':'Show low severity'}</button></div>{groups.length?<table className="table"><thead><tr><th>Priority</th><th>Work item</th><th>Why this matters</th><th>Next step</th><th>Action</th></tr></thead><tbody>{groups.map(group=><tr key={group.key}><td><Badge value={group.severity}/></td><td><strong>{group.title}</strong><div className="meta">{group.repository}{group.pr_number?` #${group.pr_number}`:''} · {group.risks.length} signal{group.risks.length>1?'s':''}</div></td><td>{group.risks.slice(0,2).map(risk=><div key={risk.id}>{risk.reason}</div>)}</td><td>{group.nextStep}</td><td><button className="secondary compactbtn" disabled={resolveRisk.isPending} onClick={()=>group.risks.forEach(risk=>resolveRisk.mutate(String(risk.id)))}>Resolve group</button></td></tr>)}</tbody></table>:<Empty title="No priority risks" text={rows.length?'Low-severity risks are hidden. Use Show low severity to review them.':'No review waits, stale pull requests, or current-head CI failures are open.'}/>}</section>
   <div className="grid">
-   <section className="card"><div className="card-header"><h2>Risk Rules</h2><span>Configurable</span></div><div className="card-body stack"><RuleInput title="Waiting for review" detail="Trigger after this many hours" value={rules.waitingReviewHours} suffix="hours" onChange={value=>setRules({...rules,waitingReviewHours:value})}/><RuleInput title="Stale pull request" detail="Trigger after this many inactive days" value={rules.stalePrDays} suffix="days" onChange={value=>setRules({...rules,stalePrDays:value})}/><RuleInput title="Large pull request" detail="Trigger above this changed-line count" value={rules.largePrLines} suffix="lines" onChange={value=>setRules({...rules,largePrLines:value})}/><RuleInput title="CI failure threshold" detail="Trigger after this many failed checks/runs" value={rules.ciFailureThreshold} suffix="failure(s)" onChange={value=>setRules({...rules,ciFailureThreshold:value})}/><p className="settings-note">Saved locally. These thresholds are sent with new report/risk preferences in the UI; server-side scanning requires rebuilding the Go server with the updated source.</p></div></section>
+   <section className="card"><div className="card-header"><h2>Risk Rules</h2><span>Version {settings.version||1}</span></div><div className="card-body stack"><RuleInput title="Waiting for review" detail="Trigger after this many hours" value={rules.waiting_review_hours} suffix="hours" onChange={value=>setRules({...rules,waiting_review_hours:value})}/><RuleInput title="Stale pull request" detail="Trigger after this many inactive days" value={rules.stale_pr_days} suffix="days" onChange={value=>setRules({...rules,stale_pr_days:value})}/><RuleInput title="CI failure threshold" detail="Trigger after this many failed checks/runs" value={rules.ci_failure_threshold} suffix="failure(s)" onChange={value=>setRules({...rules,ci_failure_threshold:value})}/><button disabled={saveRules.isPending} onClick={()=>saveRules.mutate()}>{saveRules.isPending?'Saving':'Save risk rules'}</button>{saveRules.error?<p className="inlineerror">{String(saveRules.error)}</p>:null}</div></section>
    <section className="card"><div className="card-header"><h2>Risk Mix</h2><span>Current open signals</span></div><div className="focus-list">{riskCounts(rows).map(item=><div className="focus-row" key={item.label}><span>{item.label}</span><div className="bar"><span style={{width:`${item.percent}%`}}/></div><strong>{item.count}</strong></div>)}</div></section>
   </div>
  </div>;

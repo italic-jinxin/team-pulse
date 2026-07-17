@@ -1,148 +1,244 @@
 package app
 
 import (
-	"database/sql"
 	"encoding/json"
+	"errors"
 	"net/http"
-	"os/exec"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/italic-jinxin/team-pulse/internal/credentials"
+	appdb "github.com/italic-jinxin/team-pulse/internal/database"
+	githubclient "github.com/italic-jinxin/team-pulse/internal/github"
 )
 
 func (a *App) status(w http.ResponseWriter, r *http.Request) {
-	var repos, prs, risks, members int
-	_ = a.DB.QueryRow("SELECT COUNT(*) FROM repositories").Scan(&repos)
-	_ = a.DB.QueryRow("SELECT COUNT(*) FROM pull_requests WHERE state='open'").Scan(&prs)
-	_ = a.DB.QueryRow("SELECT COUNT(*) FROM risks WHERE status='open'").Scan(&risks)
-	_ = a.DB.QueryRow("SELECT COUNT(*) FROM members").Scan(&members)
-	respond(w, 200, map[string]any{"repositories": repos, "open_pull_requests": prs, "open_risks": risks, "members": members, "data_dir": a.DataDir})
-}
-func (a *App) authStatus(w http.ResponseWriter, r *http.Request) {
-	auth.RLock()
-	set := auth.token != ""
-	source := auth.source
-	auth.RUnlock()
-	if !set {
-		if cmd := exec.Command("gh", "auth", "token"); cmd.Run() == nil {
-			set = true
-			source = "github_cli"
-		}
-	}
-	respond(w, 200, map[string]any{"authenticated": set, "source": source})
-}
-func (a *App) setToken(w http.ResponseWriter, r *http.Request) {
-	var in struct {
-		Token string `json:"token"`
-	}
-	if decode(r, &in) != nil || !strings.HasPrefix(in.Token, "github_pat_") && !strings.HasPrefix(in.Token, "ghp_") {
-		respond(w, 400, map[string]string{"error": "invalid GitHub token"})
+	status, err := a.Repository.Status(r.Context())
+	if err != nil {
+		respondAPIError(w, r, http.StatusInternalServerError, "DATABASE_ERROR", "Unable to read application status", nil)
 		return
 	}
-	c := &ghClient{token: in.Token, http: &http.Client{Timeout: 15 * time.Second}}
-	var user struct {
-		Login string `json:"login"`
-	}
-	if err := c.get(r.Context(), "/user", &user); err != nil {
-		respond(w, 401, map[string]string{"error": "GitHub rejected this token"})
-		return
-	}
-	auth.Lock()
-	auth.token = in.Token
-	auth.source = "memory"
-	auth.Unlock()
-	respond(w, 200, map[string]string{"login": user.Login})
-}
-func (a *App) clearToken(w http.ResponseWriter, r *http.Request) {
-	auth.Lock()
-	auth.token = ""
-	auth.source = ""
-	auth.Unlock()
-	respond(w, 204, nil)
+	respond(w, http.StatusOK, map[string]any{
+		"repositories":       status.Repositories,
+		"open_pull_requests": status.OpenPullRequests,
+		"open_risks":         status.OpenRisks,
+		"members":            status.Members,
+		"last_sync_at":       status.LastSyncAt,
+		"data_dir":           a.DataDir,
+		"legacy_backup":      nullable(a.LegacyBackup),
+	})
 }
 
-func rowsJSON(w http.ResponseWriter, rows *sql.Rows, err error) {
-	if err != nil {
-		respond(w, 500, map[string]string{"error": err.Error()})
+func (a *App) authStatus(w http.ResponseWriter, r *http.Request) {
+	credential, err := a.Credentials.Get(r.Context())
+	if errors.Is(err, credentials.ErrNotFound) {
+		respond(w, http.StatusOK, map[string]any{"authenticated": false, "source": "", "login": ""})
 		return
 	}
-	defer rows.Close()
-	cols, _ := rows.Columns()
-	out := []map[string]any{}
-	for rows.Next() {
-		vals := make([]any, len(cols))
-		ptrs := make([]any, len(cols))
-		for i := range vals {
-			ptrs[i] = &vals[i]
-		}
-		if rows.Scan(ptrs...) != nil {
-			continue
-		}
-		m := map[string]any{}
-		for i, c := range cols {
-			if b, ok := vals[i].([]byte); ok {
-				m[c] = string(b)
-			} else {
-				m[c] = vals[i]
-			}
-		}
-		out = append(out, m)
+	if err != nil {
+		respondAPIError(w, r, http.StatusInternalServerError, "INTERNAL_ERROR", "Unable to read credential state", nil)
+		return
 	}
-	respond(w, 200, out)
+	respond(w, http.StatusOK, map[string]any{
+		"authenticated": true,
+		"source":        credential.Source,
+		"login":         credential.Login,
+	})
 }
-func queryJSON(w http.ResponseWriter, db *sql.DB, query string, args ...any) {
-	rows, err := db.Query(query, args...)
-	rowsJSON(w, rows, err)
+
+func (a *App) setToken(w http.ResponseWriter, r *http.Request) {
+	var input struct {
+		Token string `json:"token"`
+	}
+	if decode(r, &input) != nil || (!strings.HasPrefix(input.Token, "github_pat_") && !strings.HasPrefix(input.Token, "ghp_")) {
+		respondAPIError(w, r, http.StatusBadRequest, "INVALID_ARGUMENT", "Invalid GitHub token", nil)
+		return
+	}
+	client, err := githubclient.NewClientWithBaseURL(input.Token, 15*time.Second, a.GitHubBaseURL)
+	if err != nil {
+		respondAPIError(w, r, http.StatusInternalServerError, "INTERNAL_ERROR", "Unable to configure GitHub client", nil)
+		return
+	}
+	user, err := client.CurrentUser(r.Context())
+	if err != nil {
+		respondAPIError(w, r, http.StatusUnauthorized, "GITHUB_UNAUTHORIZED", "GitHub rejected this token", nil)
+		return
+	}
+	syncedAt := time.Now().UTC().Format(time.RFC3339Nano)
+	if _, err := a.Repository.UpsertAccount(r.Context(), appdb.AccountFact{
+		GitHubID:        user.ID,
+		Login:           user.Login,
+		AvatarURL:       user.AvatarURL,
+		ProfileURL:      user.HTMLURL,
+		GitHubCreatedAt: user.CreatedAt,
+		GitHubUpdatedAt: user.UpdatedAt,
+		SyncedAt:        syncedAt,
+	}); err != nil {
+		respondAPIError(w, r, http.StatusInternalServerError, "DATABASE_ERROR", "Unable to save GitHub account", nil)
+		return
+	}
+	if err := a.Credentials.Set(r.Context(), credentials.Credential{
+		Token: input.Token, Source: "memory", Login: user.Login,
+	}); err != nil {
+		respondAPIError(w, r, http.StatusInternalServerError, "INTERNAL_ERROR", "Unable to store GitHub credential", nil)
+		return
+	}
+	respond(w, http.StatusOK, map[string]any{"authenticated": true, "login": user.Login})
 }
+
+func (a *App) clearToken(w http.ResponseWriter, r *http.Request) {
+	if err := a.Credentials.Delete(r.Context()); err != nil {
+		respondAPIError(w, r, http.StatusInternalServerError, "INTERNAL_ERROR", "Unable to clear GitHub credential", nil)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
 func (a *App) listRepositories(w http.ResponseWriter, r *http.Request) {
-	queryJSON(w, a.DB, "SELECT id,full_name,description,private,default_branch,updated_at FROM repositories ORDER BY full_name")
+	if _, err := a.Credentials.Get(r.Context()); err == nil {
+		if err := a.refreshRepositoryCatalog(r.Context()); err != nil {
+			respondAPIError(w, r, http.StatusBadGateway, "GITHUB_UNAVAILABLE", "Unable to refresh GitHub repositories", nil)
+			return
+		}
+	}
+	items, err := a.Repository.ListRepositories(r.Context())
+	if err != nil {
+		respondAPIError(w, r, http.StatusInternalServerError, "DATABASE_ERROR", "Unable to list repositories", nil)
+		return
+	}
+	respondList(w, items)
 }
+
+func (a *App) updateRepositorySelection(w http.ResponseWriter, r *http.Request) {
+	var input struct {
+		RepositoryIDs []int64 `json:"repository_ids"`
+	}
+	if decode(r, &input) != nil {
+		respondAPIError(w, r, http.StatusBadRequest, "INVALID_ARGUMENT", "Invalid repository selection", nil)
+		return
+	}
+	if err := a.Repository.SetRepositorySelection(r.Context(), input.RepositoryIDs); err != nil {
+		respondAPIError(w, r, http.StatusBadRequest, "INVALID_ARGUMENT", err.Error(), nil)
+		return
+	}
+	items, err := a.Repository.ListRepositories(r.Context())
+	if err != nil {
+		respondAPIError(w, r, http.StatusInternalServerError, "DATABASE_ERROR", "Unable to read repository selection", nil)
+		return
+	}
+	respondList(w, items)
+}
+
 func (a *App) listActivity(w http.ResponseWriter, r *http.Request) {
-	queryJSON(w, a.DB, "SELECT id,repository,actor,type,title,url,occurred_at FROM activities ORDER BY occurred_at DESC LIMIT 200")
+	items, err := a.Repository.ListActivities(r.Context(), 200)
+	if err != nil {
+		respondAPIError(w, r, http.StatusInternalServerError, "DATABASE_ERROR", "Unable to list activities", nil)
+		return
+	}
+	respondList(w, items)
 }
+
 func (a *App) listMembers(w http.ResponseWriter, r *http.Request) {
-	queryJSON(w, a.DB, "SELECT login,avatar_url,commits,pull_requests,reviews,last_active_at FROM members ORDER BY last_active_at DESC")
+	items, err := a.Repository.ListMembers(r.Context())
+	if err != nil {
+		respondAPIError(w, r, http.StatusInternalServerError, "DATABASE_ERROR", "Unable to list members", nil)
+		return
+	}
+	respondList(w, items)
 }
+
 func (a *App) listPullRequests(w http.ResponseWriter, r *http.Request) {
-	queryJSON(w, a.DB, "SELECT id,repository,number,title,author,url,state,draft,review_state,ci_state,additions,deletions,created_at,updated_at,merged_at FROM pull_requests ORDER BY updated_at DESC LIMIT 200")
+	items, err := a.Repository.ListPullRequests(r.Context(), 200)
+	if err != nil {
+		respondAPIError(w, r, http.StatusInternalServerError, "DATABASE_ERROR", "Unable to list pull requests", nil)
+		return
+	}
+	respondList(w, items)
 }
+
+func (a *App) getPullRequest(w http.ResponseWriter, r *http.Request) {
+	id, err := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
+	if err != nil {
+		respondAPIError(w, r, http.StatusBadRequest, "INVALID_ARGUMENT", "Invalid pull request ID", nil)
+		return
+	}
+	detail, err := a.Repository.GetPullRequest(r.Context(), id)
+	if errors.Is(err, appdb.ErrNotFound) {
+		respondAPIError(w, r, http.StatusNotFound, "NOT_FOUND", "Pull request not found", nil)
+		return
+	}
+	if err != nil {
+		respondAPIError(w, r, http.StatusInternalServerError, "DATABASE_ERROR", "Unable to read pull request", nil)
+		return
+	}
+	respond(w, http.StatusOK, detail)
+}
+
 func (a *App) listRisks(w http.ResponseWriter, r *http.Request) {
-	queryJSON(w, a.DB, "SELECT id,type,severity,repository,pr_number,owner,reason,suggested_action,status,detected_at FROM risks ORDER BY CASE severity WHEN 'high' THEN 1 WHEN 'medium' THEN 2 ELSE 3 END, detected_at DESC")
+	items, err := a.Repository.ListRisks(r.Context())
+	if err != nil {
+		respondAPIError(w, r, http.StatusInternalServerError, "DATABASE_ERROR", "Unable to list risks", nil)
+		return
+	}
+	respondList(w, items)
 }
+
 func (a *App) updateRisk(w http.ResponseWriter, r *http.Request) {
-	var in struct {
+	var input struct {
 		Status string `json:"status"`
 	}
-	if decode(r, &in) != nil || (in.Status != "open" && in.Status != "resolved" && in.Status != "ignored") {
-		respond(w, 400, map[string]string{"error": "invalid status"})
+	if decode(r, &input) != nil || (input.Status != "open" && input.Status != "resolved") {
+		respondAPIError(w, r, http.StatusBadRequest, "INVALID_ARGUMENT", "Invalid risk status", nil)
 		return
 	}
-	res, err := a.DB.Exec("UPDATE risks SET status=? WHERE id=?", in.Status, chi.URLParam(r, "id"))
+	err := a.Repository.SetRiskStatus(r.Context(), chi.URLParam(r, "id"), input.Status)
+	if errors.Is(err, appdb.ErrNotFound) {
+		respondAPIError(w, r, http.StatusNotFound, "NOT_FOUND", "Risk not found", nil)
+		return
+	}
 	if err != nil {
-		respond(w, 500, map[string]string{"error": err.Error()})
+		respondAPIError(w, r, http.StatusInternalServerError, "DATABASE_ERROR", "Unable to update risk", nil)
 		return
 	}
-	n, _ := res.RowsAffected()
-	if n == 0 {
-		respond(w, 404, map[string]string{"error": "not found"})
-		return
-	}
-	respond(w, 200, map[string]string{"status": in.Status})
+	respond(w, http.StatusOK, map[string]string{"status": input.Status})
 }
+
 func (a *App) listJobs(w http.ResponseWriter, r *http.Request) {
-	queryJSON(w, a.DB, "SELECT id,type,status,progress,message,created_at,started_at,ended_at,error FROM jobs ORDER BY created_at DESC LIMIT 20")
+	items, err := a.Repository.ListJobs(r.Context(), 20)
+	if err != nil {
+		respondAPIError(w, r, http.StatusInternalServerError, "DATABASE_ERROR", "Unable to list sync jobs", nil)
+		return
+	}
+	respondList(w, items)
 }
+
 func (a *App) getJob(w http.ResponseWriter, r *http.Request) {
-	queryJSON(w, a.DB, "SELECT id,type,status,progress,message,created_at,started_at,ended_at,error FROM jobs WHERE id=?", chi.URLParam(r, "id"))
+	item, err := a.Repository.GetJob(r.Context(), chi.URLParam(r, "id"))
+	if errors.Is(err, appdb.ErrNotFound) {
+		respondAPIError(w, r, http.StatusNotFound, "NOT_FOUND", "Sync job not found", nil)
+		return
+	}
+	if err != nil {
+		respondAPIError(w, r, http.StatusInternalServerError, "DATABASE_ERROR", "Unable to read sync job", nil)
+		return
+	}
+	respond(w, http.StatusOK, item)
 }
-func nullable(s string) any {
-	if s == "" {
+
+func nullable(value string) any {
+	if value == "" {
 		return nil
 	}
-	return s
+	return value
 }
+
 func nowID(prefix string) string {
 	return prefix + "_" + time.Now().UTC().Format("20060102T150405.000000000")
 }
-func marshal(v any) string { b, _ := json.Marshal(v); return string(b) }
+
+func marshal(value any) string {
+	data, _ := json.Marshal(value)
+	return string(data)
+}

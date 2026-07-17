@@ -6,3 +6,4 @@ web/*.tsbuildinfo
 desktop/macos/.build/
 *.db
 .DS_Store
+tmp/

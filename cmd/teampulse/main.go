@@ -21,6 +21,10 @@ func main() {
 	port := flag.Int("port", 19421, "preferred listen port")
 	dataDir := flag.String("data-dir", "", "application data directory")
 	flag.Parse()
+	if err := validateHost(*host); err != nil {
+		slog.Error("listen host", "error", err)
+		os.Exit(2)
+	}
 
 	a, err := app.New(*dataDir)
 	if err != nil {
@@ -57,6 +61,13 @@ func main() {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	_ = server.Shutdown(ctx)
+}
+
+func validateHost(host string) error {
+	if host != "127.0.0.1" {
+		return fmt.Errorf("TeamPulse only listens on 127.0.0.1")
+	}
+	return nil
 }
 
 func listen(host string, preferred int) (net.Listener, int, error) {

@@ -33,8 +33,8 @@ export function App(){
   staleTime:15_000,
  });
  const activeJob=useQuery({
-  queryKey:queryKeys.job(activeJobId),
-  queryFn:async()=>((await api<SyncJob[]>(`/jobs/${activeJobId}`))[0]),
+ queryKey:queryKeys.job(activeJobId),
+  queryFn:()=>api<SyncJob>(`/sync-jobs/${activeJobId}`),
   enabled:!!activeJobId,
   refetchInterval:query=>{
    const status=(query.state.data as SyncJob|undefined)?.status;
@@ -42,11 +42,12 @@ export function App(){
   },
  });
  const syncTracked=useMutation({
-  mutationFn:async()=>{
-   const repositories=(dashboard.data?.repositories||[]).map(repo=>String(repo.full_name)).filter(Boolean);
+ mutationFn:async()=>{
+   const selected=(dashboard.data?.repositories||[]).filter(repo=>repo.selected);
+   const repositories=selected.map(repo=>String(repo.full_name)).filter(Boolean);
    if(!repositories.length)throw new Error('Select repositories in Settings before syncing.');
    setSyncSelection(repositories);
-   return api<{job_id:string}>('/repositories/sync',{method:'POST',json:{repositories}});
+   return api<{job_id:string}>('/sync-jobs',{method:'POST',json:{repository_ids:selected.map(repo=>Number(repo.id))}});
   },
   onSuccess:result=>{setActiveJobId(result.job_id);setPage('Settings');queryClient.invalidateQueries({queryKey:queryKeys.dashboard});},
  });
@@ -71,6 +72,7 @@ export function App(){
   if(!activeJob.data||lastJobStatus.current===status)return;
   lastJobStatus.current=String(status||'');
   if(status==='completed'&&notifications.syncSuccess)notify('TeamPulse sync complete',activeJob.data.message||'GitHub activity has been synced.');
+  if(status==='partial'&&notifications.syncFailed)notify('TeamPulse sync completed with errors',activeJob.data.error||activeJob.data.message||'Review the failed repositories.');
   if(status==='failed'&&notifications.syncFailed)notify('TeamPulse sync failed',activeJob.data.error||activeJob.data.message||'Open TeamPulse for details.');
  },[activeJob.data?.status,queryClient,notifications.syncSuccess,notifications.syncFailed]);
 
@@ -127,20 +129,20 @@ function Page({page,data,activeJobId,syncSelection,onJobStart,onNavigate}:{page:
  if(page==='Pull Requests')return <PullRequests rows={data.prs}/>;
  if(page==='Team')return <Team rows={data.members||[]} activity={data.activity||[]}/>;
  if(page==='Repositories')return <Repositories rows={data.repositories||[]} prs={data.prs||[]} activity={data.activity||[]}/>;
- if(page==='Risks')return <Risks rows={data.risks||[]}/>;
+ if(page==='Risks')return <Risks rows={data.risks||[]} settings={data.settings||{}}/>;
  if(page==='Reports')return <Reports rows={data.reports||[]}/>;
  return <Settings auth={data.auth||{}} jobs={data.jobs||[]} externalJobId={activeJobId} externalSelection={syncSelection} onJobStart={onJobStart}/>;
 }
 
 function lastSyncLabel(data?:DashboardData){
  const jobs=data?.jobs||[];
- const completed=jobs.find(job=>job.status==='completed'&&job.ended_at);
+ const completed=jobs.find(job=>(job.status==='completed'||job.status==='partial')&&job.ended_at);
  const latest=completed?.ended_at||jobs[0]?.created_at;
  return latest?ago(latest):'never';
 }
 
 function isActiveJob(status?:string){return status==='pending'||status==='running';}
-function isTerminalJob(status?:string){return status==='completed'||status==='failed';}
+function isTerminalJob(status?:string){return status==='completed'||status==='partial'||status==='failed';}
 function isRecentActiveJob(job:Record<string,unknown>){
  if(!isActiveJob(String(job.status)))return false;
  const raw=String(job.started_at||job.created_at||'');
