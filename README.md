@@ -11,6 +11,9 @@ It is designed to help a team answer a small set of operational questions:
 
 ![TeamPulse Alpha pipeline architecture](docs/alpha-pipeline-architecture.svg)
 
+## Live Screenshots
+
+<img width="1574" height="947" alt="demo-onboarding" src="https://github.com/user-attachments/assets/82206336-ea67-4ed6-8c32-65a77ee70555" />
 <img width="1708" height="940" alt="demo" src="https://github.com/user-attachments/assets/e21a2ec0-4e17-4f50-824f-1e1ce15fbd1e" />
 
 ## Current Scope
