@@ -366,4 +366,4 @@ Run it for phase completion or API/page behavior changes. The SOP uses the isola
 
 ## License
 
-This repository does not currently declare an open-source license. Add an explicit license before publishing or distributing it.
+Licensed under the Apache License, Version 2.0. See [LICENSE](LICENSE).
